@@ -6,7 +6,7 @@ export interface SourceLocation { id:string; provider:ProviderId; label:string; 
 export interface Message { id:string; role:'user'|'assistant'|'system'; content:string; createdAt:string; }
 export interface ToolCall { id:string; name:string; input:unknown; output?:unknown; }
 export interface NormalizedSession { id:string; title:string; source:ProviderId; workspace?:string; createdAt?:string; updatedAt?:string; messages:Message[]; toolCalls:ToolCall[]; reasoning:string[]; attachments:string[]; metadata:Record<string,unknown>; }
-export interface SessionSummary { id:string; title:string; source:ProviderId; workspace?:string; updatedAt:string; messageCount:number; toolCallCount:number; status:'ready'|'warning'|'error'; }
+export interface SessionSummary { id:string; title:string; source:ProviderId; workspace?:string; updatedAt:string; messageCount:number; toolCallCount:number; status:'ready'|'warning'|'error'; sourcePath?:string; }
 export interface MigrationPlan { sourceProvider?:ProviderId; targetProvider:ProviderId; sessionIds:string[]; targetWorkspace:string; conflictPolicy:ConflictPolicy; createBackup:boolean; }
 export const PROVIDERS: Array<{id:ProviderId;name:string;mark:string;description:string}> = [
  {id:'claude-code',name:'Claude Code',mark:'C',description:'Anthropic coding sessions'},

@@ -1,0 +1,5 @@
+import { describe, expect, it } from 'vitest';
+import { buildMigrationPreview, executeMigration } from './migrationEngine';
+import { parseFixture, sessions } from '../../providers/fixtures';
+import { providerRegistry } from '../../providers/providerRegistry';
+describe('migration engine',()=>{const source=parseFixture(sessions[0]); const plan={sourceProvider:'claude-code' as const,targetProvider:'dsh' as const,sessionIds:[source.id],targetWorkspace:'C:/tmp',conflictPolicy:'new-id' as const,createBackup:true}; it('builds preview',()=>{const p=buildMigrationPreview(plan,[source],providerRegistry.dsh); expect(p.sessionCount).toBe(1); expect(p.messageCount).toBe(source.messages.length); expect(p.unsupported).toContain('metadata.unknownField')}); it('runs hooks in order',async()=>{const calls:string[]=[]; const report=await executeMigration(plan,[source],{createBackup:()=>{calls.push('backup')},writeTemp:()=>{calls.push('temp')},verify:()=>true,commit:()=>{calls.push('commit')}}); expect(report[0].status).toBe('verified'); expect(calls).toEqual(['backup','temp','commit'])})});

@@ -1,0 +1,2 @@
+import { useMemo, useState } from 'react'; import type { Locale } from '../types/domain'; import { getMessage } from './messages';
+export function useI18n(){ const [locale,setLocaleState]=useState<Locale>(()=>(localStorage.getItem('cyanbird-locale') as Locale)||'zh-CN'); const setLocale=(next:Locale)=>{localStorage.setItem('cyanbird-locale',next);setLocaleState(next)}; return useMemo(()=>({locale,setLocale,t:(key:string)=>getMessage(locale,key)}),[locale]); }

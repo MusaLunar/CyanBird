@@ -3,10 +3,11 @@
 mod discovery;
 mod metadata;
 mod storage;
+mod migration;
 
 fn main() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![discovery::discover_sources, discovery::discover_sessions, storage::get_preferences, storage::save_preferences, storage::create_backup, storage::list_backups, storage::export_markdown, storage::open_output_directory, storage::preview_session])
+        .invoke_handler(tauri::generate_handler![discovery::discover_sources, discovery::discover_sessions, storage::get_preferences, storage::save_preferences, storage::create_backup, storage::list_backups, storage::export_markdown, storage::open_output_directory, storage::preview_session, migration::preview_migration, migration::execute_migration])
         .run(tauri::generate_context!())
         .expect("error while running CyanBird");
 }

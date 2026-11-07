@@ -9,6 +9,8 @@ beforeEach(()=>{localStorage.clear();vi.mocked(invoke).mockImplementation(async(
  if(command==='discover_sessions') return ['one','two'].map(id=>({id,title:id,source:'claude-code',workspace:'C:/Project',updatedAt:'1794000000000',messageCount:2,toolCallCount:1,status:'ready'}));
  if(command==='get_preferences'||command==='save_preferences')return {backupDirectory:'C:/Backups',exportDirectory:'C:/Exports'};
  if(command==='list_backups')return [];
+ if(command==='preview_migration')return {targetDirectory:'D:/Target/sessions',messageCount:2};
+ if(command==='execute_migration')return {backupDirectory:'C:/Backups/before',items:[{targetId:'new',path:'D:/Target/sessions/new.jsonl',status:'written'}]};
  if(command==='create_backup')return {directory:'C:/Backups/snapshot'};
  if(command==='export_markdown')return {directory:'C:/Exports/session',files:['session.md']};
  return null;
@@ -31,4 +33,15 @@ it('orders configuration before actions and keeps row previews separate',async()
  expect(output.compareDocumentPosition(backup)&Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
  fireEvent.click(screen.getByRole('button',{name:'预览 two'}));await waitFor(()=>expect(invoke).toHaveBeenCalledWith('preview_session',{provider:'claude-code',id:'two'}));
  expect(screen.getAllByRole('checkbox')[1]).toHaveAttribute('aria-checked','false');
+});
+
+it('requires a current preview and acknowledgment before native migration',async()=>{
+ render(<App/>);fireEvent.click((await screen.findAllByRole('checkbox'))[0]);
+ const execute=screen.getByRole('button',{name:'执行迁移'});expect(execute).toBeDisabled();
+ fireEvent.click(screen.getByRole('button',{name:'生成迁移预览'}));
+ const acknowledgment=await screen.findByLabelText(/确认转换差异/);fireEvent.click(acknowledgment);expect(execute).toBeEnabled();
+ fireEvent.change(screen.getByLabelText('目标项目文件夹'),{target:{value:'D:/Different'}});expect(execute).toBeDisabled();
+ fireEvent.click(screen.getByRole('button',{name:'生成迁移预览'}));fireEvent.click(await screen.findByLabelText(/确认转换差异/));fireEvent.click(execute);
+ await waitFor(()=>expect(invoke).toHaveBeenCalledWith('execute_migration',{provider:'claude-code',ids:['one'],target:'dsh',workspace:'D:/Different',acknowledged:true}));
+ await screen.findByText('已写入');
 });

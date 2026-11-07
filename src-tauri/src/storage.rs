@@ -34,7 +34,7 @@ fn fresh_directory(root:&Path,prefix:&str) -> Result<PathBuf,String> {
  let stamp=SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e|e.to_string())?.as_nanos();
  let path=root.join(format!("{prefix}-{stamp}"));fs::create_dir(&path).map_err(|e|e.to_string())?;Ok(path)
 }
-fn chosen(provider:String,ids:Vec<String>) -> Result<Vec<SessionSummary>,String> {
+pub(crate) fn chosen(provider:String,ids:Vec<String>) -> Result<Vec<SessionSummary>,String> {
  if ids.is_empty(){return Err("Select at least one session".into())}
  let unique:HashSet<_>=ids.iter().collect();
  let result:Vec<_>=scan_sessions(provider).into_iter().filter(|s|unique.contains(&s.id)).collect();
@@ -87,7 +87,7 @@ fn body(value:&Value)->String {
   else {Some(fence(&serde_json::to_string_pretty(part).unwrap_or_default(),"json"))}
  }).collect::<Vec<_>>().join("\n\n")}else{text_content(value)}
 }
-fn markdown_records(session:&SessionSummary,records:&[Value])->String{
+pub(crate) fn markdown_records(session:&SessionSummary,records:&[Value])->String{
  let mut out=format!("# {}\n\nAgent: {}\n\nSession: {}\n\nWorkspace: {}\n\n",session.title.replace('\n'," "),session.source,session.id,session.workspace.as_deref().unwrap_or("Not recorded"));
  for r in records {
   let t=r["type"].as_str().unwrap_or_default();
@@ -113,7 +113,7 @@ fn markdown_records(session:&SessionSummary,records:&[Value])->String{
  }
  out
 }
-fn read_export_records(session:&SessionSummary)->Result<Vec<Value>,String>{
+pub(crate) fn read_export_records(session:&SessionSummary)->Result<Vec<Value>,String>{
  if session.source=="zcode" {
   let db=Connection::open_with_flags(&session.source_path,OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e|e.to_string())?;
   let mut messages=db.prepare("SELECT id,data FROM message WHERE session_id=?1 ORDER BY time_created,id").map_err(|e|e.to_string())?;

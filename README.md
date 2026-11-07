@@ -17,6 +17,6 @@ Desktop builds require Rust with the Windows MSVC toolchain, Visual C++ build to
 
 ## Current scope
 
-Native read-only discovery is connected for Claude Code, Antigravity, Codex, Zcode and DSH. The migration UI and injectable migration engine remain under development; real provider conversion, backup/restore and transactional writes are not complete. See [compatibility](docs/compatibility.md) and [reference analysis](docs/dsh-chat-import-analysis.md).
+Native read-only discovery is connected for Claude Code, Antigravity, Codex, Zcode and DSH. Migration to Claude Code, Codex, DSH V4 and Zcode supports historical text with mandatory backups and per-session results. Antigravity is currently source-only. See [migration details](docs/migration.md) for fidelity and compatibility limits. See [compatibility](docs/compatibility.md) and [reference analysis](docs/dsh-chat-import-analysis.md).
 
 Update checks query the latest public GitHub Release from MusaLunar/CyanBird and link to release notes; automatic update installation is not implemented.

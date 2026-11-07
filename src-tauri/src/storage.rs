@@ -177,3 +177,8 @@ fn export_to(root:&Path,sessions:&[SessionSummary])->Result<ExportReceipt,String
   let target=root.join("copy.sqlite");snapshot_file(&source,&target).unwrap();let backup=Connection::open(&target).unwrap();let id:String=backup.query_row("SELECT id FROM session",[],|r|r.get(0)).unwrap();assert_eq!(id,"wal-session");drop(backup);drop(db);fs::remove_dir_all(root).unwrap();
  }
 }
+
+#[tauri::command]
+pub async fn preview_session(provider:String,id:String)->Result<String,String>{
+ tauri::async_runtime::spawn_blocking(move||{let sessions=chosen(provider,vec![id])?;let session=&sessions[0];let records=read_export_records(session)?;Ok(markdown_records(session,&records))}).await.map_err(|e|e.to_string())?
+}

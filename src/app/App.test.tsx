@@ -23,3 +23,12 @@ it('opens backup and settings routes and saves paths',async()=>{
 it('creates a backup for only the selected session',async()=>{
  render(<App/>);fireEvent.click((await screen.findAllByRole('checkbox'))[1]);fireEvent.click(screen.getByRole('button',{name:'创建备份'}));await waitFor(()=>expect(invoke).toHaveBeenCalledWith('create_backup',{provider:'claude-code',ids:['two']}));await screen.findByText('备份已创建并校验。');
 });
+it('orders configuration before actions and keeps row previews separate',async()=>{
+ render(<App/>);fireEvent.click((await screen.findAllByRole('checkbox'))[0]);
+ expect(screen.getByText('已选 1 项')).toBeInTheDocument();expect(screen.getByRole('button',{name:'全选'})).toBeInTheDocument();
+ expect(screen.queryByText('Zcode 备份包含整个会话数据库。')).toBeNull();
+ const output=screen.getByText('输出位置'), backup=screen.getByRole('button',{name:'创建备份'});
+ expect(output.compareDocumentPosition(backup)&Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+ fireEvent.click(screen.getByRole('button',{name:'预览 two'}));await waitFor(()=>expect(invoke).toHaveBeenCalledWith('preview_session',{provider:'claude-code',id:'two'}));
+ expect(screen.getAllByRole('checkbox')[1]).toHaveAttribute('aria-checked','false');
+});

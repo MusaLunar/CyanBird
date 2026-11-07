@@ -1,80 +1,119 @@
-import { useEffect, useMemo, useState } from 'react';
-import { Archive, ArrowDown, ArrowRight, Check, CircleAlert, CloudDownload, Copy, ExternalLink, FolderOpen, Languages, LayoutGrid, Moon, RefreshCw, Search, Settings2, ShieldCheck, Sparkles, Sun, Upload, X } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { Archive, ArrowRight, Check, CircleAlert, Download, ExternalLink, FolderOpen, Languages, LayoutGrid, Moon, RefreshCw, Search, Settings2, ShieldCheck, Sun, X } from 'lucide-react';
 import { PROVIDERS, type SessionSummary, type SourceLocation } from '../types/domain';
-
-import { discoverSessions, discoverSources } from '../lib/tauri';
+import { createBackup, discoverSessions, discoverSources, exportMarkdown, getPreferences, listBackups, openOutputDirectory, savePreferences, type BackupRecord, type Preferences } from '../lib/tauri';
 import { useI18n } from '../i18n/I18nProvider';
-import { useWorkbenchState } from './useWorkbenchState';
+import { sessionKey, useWorkbenchState } from './useWorkbenchState';
+import { AgentIcon } from './AgentIcon';
 
 const APP_VERSION = '0.1.0';
-const RELEASES_API = 'https://api.github.com/repos/MusaLunar/CyanBird/releases/latest';
-
-type UpdateState = { status: 'idle' | 'checking' | 'latest' | 'available' | 'none' | 'error'; version?: string; url?: string };
-
-function isNewerVersion(latest: string) {
-  const clean = (value: string) => value.replace(/^v/i, '').split('.').map((part) => Number.parseInt(part, 10) || 0);
-  const [a, b, c] = clean(latest);
-  const [x, y, z] = clean(APP_VERSION);
-  return a > x || (a === x && (b > y || (b === y && c > z)));
-}
-
+type Page = 'migration' | 'backups' | 'settings';
+type Update = { status: 'idle' | 'checking' | 'latest' | 'available' | 'none' | 'error'; version?: string; url?: string };
 export function App() {
   const { t, locale, setLocale } = useI18n();
+  const tr = (zh: string, en: string) => locale === 'zh-CN' ? zh : en;
   const state = useWorkbenchState();
+  const [page, setPage] = useState<Page>('migration');
   const [query, setQuery] = useState('');
-  const [dark, setDark] = useState(false);
-  const [liveSources, setLiveSources] = useState<SourceLocation[]>([]);
-  const [liveSessions, setLiveSessions] = useState<SessionSummary[]>([]);
-  const [scanError, setScanError] = useState('');
-  const scanSources = () => { setScanError(''); discoverSources().then(setLiveSources).catch((error) => setScanError(String(error))); };
-  useEffect(scanSources, []);
-  useEffect(() => {
-    let active = true;
-    setLiveSessions([]);
-    discoverSessions(state.source).then((next) => { if (active) setLiveSessions(next); }).catch((error) => { if (active) setScanError(String(error)); });
-    return () => { active = false; };
-  }, [state.source]);
-  const [update, setUpdate] = useState<UpdateState>({ status: 'idle' });
-  const activeSource = liveSources.find((item) => item.provider === state.source) ?? { path: '', status: 'scanning' };
+  const [dark, setDark] = useState(() => localStorage.getItem('cyanbird-theme') === 'dark');
+  const [sources, setSources] = useState<SourceLocation[]>([]);
+  const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [backups, setBackups] = useState<BackupRecord[]>([]);
+  const [prefs, setPrefs] = useState<Preferences>({ backupDirectory: '', exportDirectory: '' });
+  const [prefsLoaded, setPrefsLoaded] = useState(false);
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+  const [output, setOutput] = useState<{ path: string; kind: 'backup' | 'export' }>();
+  const [loading, setLoading] = useState(true);
+  const [scanning, setScanning] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [lastScan, setLastScan] = useState<Date>();
+  const [preview, setPreview] = useState(false);
+  const [update, setUpdate] = useState<Update>({ status: 'idle' });
+  const request = useRef(0);
+  const actionLock = useRef(false);
   const source = PROVIDERS.find((item) => item.id === state.source)!;
   const target = PROVIDERS.find((item) => item.id === state.target)!;
-  const visibleSessions = liveSessions.filter((item) => item.source === state.source && item.title.toLowerCase().includes(query.toLowerCase()));
-  const selectedSessions = liveSessions.filter((item) => state.selected.includes(item.id));
-  const stats = useMemo(() => selectedSessions.reduce((result, item) => ({ messages: result.messages + item.messageCount, tools: result.tools + item.toolCallCount }), { messages: 0, tools: 0 }), [selectedSessions]);
-  const checkForUpdates = async () => {
+  const activeSource = sources.find((item) => item.provider === state.source);
+  const visible = sessions.filter((item) => `${item.title} ${item.workspace ?? ''}`.toLowerCase().includes(query.toLowerCase()));
+  const selected = sessions.filter((item) => state.selected.includes(sessionKey(item)));
+  const allSelected = visible.length > 0 && visible.every((item) => state.selected.includes(sessionKey(item)));
+  const stats = useMemo(() => selected.reduce((result, item) => ({ messages: result.messages + item.messageCount, tools: result.tools + item.toolCallCount }), { messages: 0, tools: 0 }), [selected]);
+  const fail = (reason: unknown) => setError(String(reason));
+  const date = (value: string) => new Date(/^\d+$/.test(value) ? Number(value) : value).toLocaleString(locale);
+  const refreshBackups = () => listBackups().then(setBackups).catch(fail);
+  const loadSessions = (provider: string) => {
+    const token = ++request.current;
+    setLoading(true); setSessions([]); setError('');
+    return discoverSessions(provider).then((items) => { if (token === request.current) setSessions(items); }).catch((reason) => { if (token === request.current) fail(reason); }).finally(() => { if (token === request.current) setLoading(false); });
+  };
+  const scan = () => {
+    if (scanning) return;
+    setScanning(true);
+    discoverSources().then((items) => { setSources(items); setLastScan(new Date()); }).catch(fail).finally(() => setScanning(false));
+    void loadSessions(state.source);
+  };
+  useEffect(() => {
+    discoverSources().then((items) => { setSources(items); setLastScan(new Date()); }).catch(fail);
+    getPreferences().then((value) => { setPrefs(value); setPrefsLoaded(true); }).catch(fail);
+  }, []);
+  useEffect(() => { void loadSessions(state.source); setPreview(false); }, [state.source]);
+  useEffect(() => { if (page === 'backups') void refreshBackups(); }, [page]);
+  useEffect(() => { localStorage.setItem('cyanbird-theme', dark ? 'dark' : 'light'); }, [dark]);
+  const runAction = async (kind: 'backup' | 'export') => {
+    if (actionLock.current || !selected.length || !prefsLoaded) return;
+    actionLock.current = true; setBusy(true); setError(''); setNotice(''); setOutput(undefined);
+    try {
+      const ids = selected.map((item) => item.id);
+      const result = kind === 'backup' ? await createBackup(state.source, ids) : await exportMarkdown(state.source, ids);
+      setOutput({ path: result.directory, kind });
+      setNotice(kind === 'backup' ? tr('备份已创建并校验。', 'Backup created and verified.') : tr('Markdown 已导出。', 'Markdown exported.'));
+      if (kind === 'backup') await refreshBackups();
+    } catch (reason) { fail(reason); }
+    finally { actionLock.current = false; setBusy(false); }
+  };
+  const save = async (event: React.FormEvent) => {
+    event.preventDefault(); setBusy(true); setError(''); setNotice('');
+    try { setPrefs(await savePreferences(prefs)); setNotice(tr('设置已保存。', 'Settings saved.')); }
+    catch (reason) { fail(reason); } finally { setBusy(false); }
+  };
+  const checkUpdates = async () => {
     setUpdate({ status: 'checking' });
     try {
-      const response = await fetch(RELEASES_API, { headers: { Accept: 'application/vnd.github+json' } });
+      const response = await fetch('https://api.github.com/repos/MusaLunar/CyanBird/releases/latest', { headers: { Accept: 'application/vnd.github+json' }, signal: AbortSignal.timeout(15000) });
       if (response.status === 404) { setUpdate({ status: 'none' }); return; }
       if (!response.ok) throw new Error(`GitHub ${response.status}`);
-      const release = await response.json() as { tag_name?: string; html_url?: string; draft?: boolean; prerelease?: boolean };
-      if (!release.tag_name || release.draft || release.prerelease) { setUpdate({ status: 'none' }); return; }
-      setUpdate(isNewerVersion(release.tag_name) ? { status: 'available', version: release.tag_name, url: release.html_url } : { status: 'latest', version: release.tag_name, url: release.html_url });
+      const release = await response.json();
+      if (typeof release.tag_name !== 'string') throw new Error('Invalid release');
+      const parts = (v: string) => v.replace(/^v/, '').split('.').map((n) => Number.parseInt(n) || 0);
+      const current = parts(APP_VERSION), latest = parts(release.tag_name);
+      const difference = latest.findIndex((n, i) => n !== current[i]);
+      setUpdate({ status: difference >= 0 && latest[difference] > current[difference] ? 'available' : 'latest', version: release.tag_name, url: `https://github.com/MusaLunar/CyanBird/releases/tag/${encodeURIComponent(release.tag_name)}` });
     } catch { setUpdate({ status: 'error' }); }
   };
-  const updateLabel = update.status === 'checking' ? t('updateChecking') : update.status === 'available' ? `${t('updateAvailable')} ${update.version}` : update.status === 'latest' ? `${t('updateLatest')} ${update.version || `v${APP_VERSION}`}` : update.status === 'none' ? t('updateNone') : update.status === 'error' ? t('updateError') : t('updateCheck');
-
+  const updateLabel = update.status === 'checking' ? t('updateChecking') : update.status === 'available' ? `${t('updateAvailable')} ${update.version}` : update.status === 'latest' ? t('updateLatest') : update.status === 'none' ? t('updateNone') : update.status === 'error' ? t('updateError') : t('updateCheck');
+  const chooseSource = (id: typeof state.source) => { state.setSource(id); setQuery(''); setPreview(false); };
   return <div className={dark ? 'app dark' : 'app'} data-ark-theme="ark" data-ark-depth="moderate">
-    <aside className="rail" aria-label="Primary navigation">
+    <aside className="rail" aria-label={tr('主导航', 'Primary navigation')}>
       <div className="rail-brand"><img className="brand-logo" src="/cyanbird-logo.png" alt="CyanBird" /><span className="rail-brand-name">CYANBIRD</span><span className="rail-brand-sub">SESSION SYSTEM</span></div>
       <div className="rail-divider" />
-      <nav className="rail-nav"><div className="rail-section-label">WORKSPACE</div><button className="rail-item active"><LayoutGrid size={16} aria-hidden="true"/><span>{t('nav.migration')}</span><b>01</b></button><button className="rail-item"><Archive size={16} aria-hidden="true"/><span>{t('nav.backups')}</span><b>04</b></button><button className="rail-item"><Settings2 size={16} aria-hidden="true"/><span>{t('nav.settings')}</span><b>··</b></button></nav>
-      <div className="rail-foot"><div className="rail-foot-label">LOCAL / WIN</div><div className="rail-foot-state"><span className="signal-dot" /> {t('ready')}</div><div className="rail-foot-rule" /><button className="update-link" onClick={checkForUpdates}><RefreshCw size={12}/><span>{updateLabel}</span></button><div className="rail-foot-meta">CYB-OPS / v{APP_VERSION}</div></div>
+      <nav className="rail-nav"><div className="rail-section-label">WORKSPACE</div>{(['migration', 'backups', 'settings'] as const).map((name) => <button key={name} className={`rail-item ${page === name ? 'active' : ''}`} aria-current={page === name ? 'page' : undefined} onClick={() => setPage(name)}>{name === 'migration' ? <LayoutGrid size={16} /> : name === 'backups' ? <Archive size={16} /> : <Settings2 size={16} />}<span>{t(`nav.${name}`)}</span></button>)}</nav>
+      <div className="rail-foot"><div className="rail-foot-label">LOCAL / WIN</div><button className="update-link" onClick={checkUpdates} disabled={update.status === 'checking'}><RefreshCw size={12} /><span>{updateLabel}</span></button><div className="rail-foot-meta">CyanBird / v{APP_VERSION}</div></div>
     </aside>
-
     <main className="stage">
-      <header className="stage-header"><div className="stage-title"><div className="micro-label">CYANBIRD / MIGRATION WORKSPACE</div><h1>{locale === 'zh-CN' ? '把会话带到下一处工作区' : 'Move sessions forward'}</h1><p>{locale === 'zh-CN' ? '把上下文完整带走，源文件保持在原地。' : 'Carry context forward while keeping source files in place.'}</p></div><div className="stage-actions"><button className="square-button" onClick={() => setDark(!dark)} aria-label="Toggle theme" title="Toggle theme">{dark ? <Sun size={16}/> : <Moon size={16}/>}</button><button className="language-button" onClick={() => setLocale(locale === 'zh-CN' ? 'en-US' : 'zh-CN')}><Languages size={15}/>{locale === 'zh-CN' ? '中 / EN' : 'EN / 中'}</button><button className="outline-button header-update" onClick={checkForUpdates} disabled={update.status === 'checking'}><RefreshCw size={14}/>{updateLabel}</button><button className="signal-button" onClick={scanSources} title={t('scan')}><CloudDownload size={15}/>{t('scan')}</button></div></header>
-      {update.status === 'available' && update.url && <div className="update-banner"><span><CircleAlert size={15}/><b>{t('updateAvailable')} {update.version}</b></span><a href={update.url} target="_blank" rel="noreferrer">{t('openRelease')} <ExternalLink size={13}/></a></div>}
-      {scanError && <p role="alert">{scanError}</p>}
-      <section className="status-strip" aria-label="Workspace status"><span><span className="signal-dot" /> LOCAL WORKSPACE CONNECTED</span><span className="status-rule" /><span>LAST SCAN · 02 MIN AGO</span><span className="status-spacer" /><span className="status-mark">C/B</span></section>
-      <section className="workspace" aria-label="Migration workspace">
-        <section className="source-zone zone"><div className="zone-header"><div><div className="zone-index">01</div><h2>{t('sources')}</h2><span className="zone-caption">DISCOVERED AGENTS</span></div><button className="quiet-button" onClick={scanSources} aria-label={t('refresh')}><RefreshCw size={15}/></button></div><div className="source-list">{liveSources.map((item) => { const provider = PROVIDERS.find((entry) => entry.id === item.provider)!; return <button key={item.id} onClick={() => state.setSource(item.provider)} className={`source-line ${state.source === item.provider ? 'selected' : ''}`}><span className={`provider-mark ${item.provider}`}>{provider.mark}</span><span className="source-line-copy"><b>{provider.name}</b><small>{item.path}</small></span><span className={`state-dot ${item.status}`} /><span className="source-line-count">{item.status === 'unavailable' ? '—' : item.sessionCount}</span></button>; })}</div><div className="zone-footer"><FolderOpen size={14}/><span>{t('sourcePath')}</span><ArrowDown size={13}/></div></section>
-        <section className="session-zone zone"><div className="zone-header"><div><div className="zone-index">02</div><h2>{source.name}</h2><span className="zone-caption">{activeSource.path}</span></div><div className="zone-status"><span className={`state-dot ${activeSource.status}`} /> {activeSource.status === 'ready' ? t('ready') : t('unavailable')}</div></div><div className="search-line"><Search size={15}/><input aria-label={t('search')} value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t('search')}/>{query && <button onClick={() => setQuery('')} aria-label="Clear search"><X size={14}/></button>}</div><div className="session-toolbar"><span>{visibleSessions.length} {locale === 'zh-CN' ? '个会话' : 'SESSIONS'}</span><button onClick={() => visibleSessions.forEach((item) => !state.selected.includes(item.id) && state.toggle(item.id))}>{t('selected')} {state.selected.length}</button></div><div className="session-list">{activeSource.status === 'unavailable' ? <div className="empty-state"><CircleAlert size={25}/><b>{t('unavailable')}</b><span>{locale === 'zh-CN' ? '该 Agent 尚未发现本地会话目录。' : 'No local session directory found yet.'}</span></div> : visibleSessions.map((item) => <button key={item.id} className={`session-line ${state.selected.includes(item.id) ? 'checked' : ''}`} onClick={() => state.toggle(item.id)}><span className="checkbox">{state.selected.includes(item.id) && <Check size={12}/>}</span><span className="session-copy"><b>{item.title || item.id}</b><small>{item.workspace}</small><span className="session-data"><em>{item.messageCount} {t('messages')}</em><em>{item.toolCallCount} {t('tools')}</em></span></span><span className="session-date">{new Date(/^\d+$/.test(item.updatedAt) ? Number(item.updatedAt) : item.updatedAt).toLocaleDateString(locale, { month: '2-digit', day: '2-digit' })}</span></button>)}</div></section>
-        <section className="plan-zone zone"><div className="zone-header"><div><div className="zone-index">03</div><h2>{t('plan')}</h2><span className="zone-caption">TARGET CONFIGURATION</span></div><div className="zone-status"><span className="state-dot ready" /> {t('ready')}</div></div>{selectedSessions.length === 0 ? <div className="plan-empty"><div className="plan-empty-mark"><ArrowRight size={24}/></div><h3>{t('noSelection')}</h3><p>{locale === 'zh-CN' ? '从中间列表选择会话，生成目标格式预览。' : 'Select sessions to generate a target format preview.'}</p></div> : <><div className="route-line"><div className="route-node"><span className={`provider-mark ${source.id}`}>{source.mark}</span><div><b>{source.name}</b><small>{selectedSessions.length} {t('sessions')}</small></div></div><ArrowRight size={16}/><div className="route-node"><span className={`provider-mark ${target.id}`}>{target.mark}</span><div><b>{target.name}</b><small>{state.backup ? 'BACKUP ON' : 'BACKUP OFF'}</small></div></div></div><div className="plan-field"><label>{t('target')} <span>TARGET AGENT</span></label><div className="target-grid">{PROVIDERS.filter((item) => item.id !== state.source).map((item) => <button key={item.id} className={state.target === item.id ? 'chosen' : ''} onClick={() => state.setTarget(item.id)}><span className={`provider-mark ${item.id}`}>{item.mark}</span>{item.name}{state.target === item.id && <Check size={13}/>}</button>)}</div></div><div className="plan-field inline"><label>{t('conflict')} <span>WRITE POLICY</span></label><select value={state.policy} onChange={(event) => state.setPolicy(event.target.value as any)}><option value="new-id">{t('newId')}</option><option value="overwrite">{t('overwrite')}</option><option value="skip">{t('skip')}</option></select></div><label className="backup-toggle"><input type="checkbox" checked={state.backup} onChange={(event) => state.setBackup(event.target.checked)}/><span className="toggle-track"/><span>{t('backup')}</span></label><div className="stat-row"><div><b>{stats.messages}</b><span>{t('messages')}</span></div><div><b>{stats.tools}</b><span>{t('tools')}</span></div><div><b>{selectedSessions.length}</b><span>{t('sessions')}</span></div></div><div className="notice"><CircleAlert size={15}/><span>{t('warning')} <b>metadata.unknownField</b></span></div><div className="plan-actions"><button className="outline-button"><Copy size={15}/>{t('preview')}</button><button className="signal-button commit"><Upload size={15}/>{t('execute')}<ArrowRight size={15}/></button></div></>}</section>
-      </section><footer className="stage-footer"><span><ShieldCheck size={14}/> {t('safe')}</span><span className="footer-spacer" /><span><Sparkles size={13}/> BUILT FOR MULTI-AGENT WORKFLOWS</span></footer>
+      <header className="stage-header"><div className="stage-title"><h1>{t(`nav.${page}`)}</h1><p>{page === 'migration' ? tr('管理上下文，保留每一次对话。', 'Keep every conversation and its context.') : page === 'backups' ? tr('查看已完成的备份与源文件校验记录。', 'Review completed snapshots and file checksums.') : tr('管理本地存储、语言与外观。', 'Manage local storage, language and appearance.')}</p></div><div className="stage-actions"><button className="square-button" aria-label={tr('切换主题', 'Toggle theme')} onClick={() => setDark(!dark)}>{dark ? <Sun size={16} /> : <Moon size={16} />}</button><button className="language-button" onClick={() => setLocale(locale === 'zh-CN' ? 'en-US' : 'zh-CN')}><Languages size={15} />{locale === 'zh-CN' ? '中 / EN' : 'EN / 中'}</button>{page === 'migration' && <button className="signal-button" disabled={scanning || busy} onClick={scan}><RefreshCw size={15} />{scanning ? tr('扫描中…', 'Scanning…') : t('scan')}</button>}</div></header>
+      {error && <div className="message error-message" role="alert"><CircleAlert size={16} /><span>{error}</span><button aria-label={tr('关闭错误', 'Dismiss error')} onClick={() => setError('')}><X size={15} /></button></div>}
+      {notice && <div className="message" role="status"><Check size={16} /><div>{notice}{output && <small className="output-path">{output.path}</small>}</div>{output && <button className="outline-button" onClick={() => openOutputDirectory(output.kind).catch(fail)}><FolderOpen size={14} />{tr('打开文件夹', 'Open folder')}</button>}</div>}
+      {update.status === 'available' && update.url && <div className="update-banner">{updateLabel}<a href={update.url} target="_blank" rel="noreferrer">{t('openRelease')}<ExternalLink size={13} /></a></div>}
+      <div className="status-strip"><span>{busy ? tr('正在处理，请勿关闭应用', 'Processing · keep the app open') : tr('本地文件 · 主会话', 'LOCAL FILES · MAIN SESSIONS')}</span><span className="status-spacer" />{lastScan && <span>{tr('扫描于', 'Scanned at')} {lastScan.toLocaleTimeString(locale)}</span>}</div>
+      {page === 'migration' && <section className="workspace" aria-label={tr('迁移工作台', 'Migration workspace')}>
+        <section className="source-zone zone"><div className="zone-header"><div><h2>{t('sources')}</h2></div></div><div className="source-list">{PROVIDERS.map((provider) => { const item = sources.find((s) => s.provider === provider.id); return <button key={provider.id} disabled={busy} aria-pressed={state.source === provider.id} className={`source-line ${state.source === provider.id ? 'selected' : ''}`} onClick={() => chooseSource(provider.id)}><AgentIcon provider={provider.id} /><span className="source-line-copy"><b>{provider.name}</b><small title={item?.path}>{item?.path || tr('等待扫描', 'Awaiting scan')}</small></span><span className="source-line-count">{item?.sessionCount ?? '—'}</span></button>; })}</div><p className="zone-help">{tr('子代理不列入主会话，原始文件保持不变。', 'Subagents are excluded from this list. Original files stay untouched.')}</p></section>
+        <section className="session-zone zone"><div className="zone-header"><div><h2>{source.name}</h2><span className="zone-caption" title={activeSource?.path}>{activeSource?.path}</span></div></div><div className="search-line"><Search size={15} /><input aria-label={t('search')} placeholder={tr('搜索标题或项目路径…', 'Search title or project…')} value={query} onChange={(e) => setQuery(e.target.value)} />{query && <button aria-label={tr('清空搜索', 'Clear search')} onClick={() => setQuery('')}><X size={14} /></button>}</div><div className="session-toolbar"><span>{loading ? tr('读取中…', 'Reading…') : `${visible.length} ${tr('个会话', 'sessions')}`}</span><button disabled={busy || loading || !visible.length} onClick={() => state.setSelected(allSelected ? state.selected.filter((key) => !visible.some((item) => sessionKey(item) === key)) : Array.from(new Set([...state.selected, ...visible.map(sessionKey)])))}>{allSelected ? tr('取消全选', 'Clear selection') : tr('全选', 'Select all')} · {selected.length}</button></div><div className="session-list" aria-busy={loading}>{loading ? <p className="empty-copy">{tr('正在读取会话元数据…', 'Reading session metadata…')}</p> : !visible.length ? <p className="empty-copy">{query ? tr('没有匹配的会话。', 'No matching sessions.') : tr('没有发现可读取的主会话。', 'No readable main sessions found.')}</p> : visible.map((item) => <button key={sessionKey(item)} disabled={busy} role="checkbox" aria-checked={state.selected.includes(sessionKey(item))} className={`session-line ${state.selected.includes(sessionKey(item)) ? 'checked' : ''}`} onClick={() => state.toggle(sessionKey(item))}><span className="checkbox" aria-hidden="true">{state.selected.includes(sessionKey(item)) && <Check size={12} />}</span><span className="session-copy"><b title={item.title}>{item.title || item.id}</b><small title={item.workspace}>{item.workspace || tr('未记录项目路径', 'Project path not recorded')}</small><span className="session-data"><em>{item.messageCount} {t('messages')}</em><em>{item.toolCallCount} {t('tools')}</em></span></span><time className="session-date">{new Date(Number(item.updatedAt) || item.updatedAt).toLocaleDateString(locale, { month: '2-digit', day: '2-digit' })}</time></button>)}</div></section>
+        <section className="plan-zone zone"><div className="zone-header"><h2>{t('plan')}</h2></div>{!selected.length ? <div className="plan-empty"><div className="plan-empty-mark"><ArrowRight size={24} /></div><h3>{t('noSelection')}</h3><p>{tr('选择会话后，可以创建备份或导出 Markdown。', 'Select sessions to create a backup or export Markdown.')}</p></div> : <><div className="route-line"><AgentIcon provider={source.id} /><b>{source.name}</b><span className="status-spacer" /><span>{selected.length} {tr('已选', 'selected')}</span></div><div className="stat-row"><div><b>{stats.messages}</b><span>{t('messages')}</span></div><div><b>{stats.tools}</b><span>{t('tools')}</span></div><div><b>{selected.length}</b><span>{t('sessions')}</span></div></div><div className="file-actions"><button className="signal-button" disabled={busy || !prefsLoaded} onClick={() => runAction('backup')}><Archive size={15} />{tr('创建备份', 'Create backup')}</button><button className="outline-button" disabled={busy || !prefsLoaded} onClick={() => runAction('export')}><Download size={15} />{tr('导出 Markdown', 'Export Markdown')}</button></div><p className="zone-help">{tr('源文件不会被修改。Zcode 备份包含整个会话数据库。', 'Source files are preserved. Zcode backups include the entire session database.')}</p><details className="output-details"><summary>{tr('输出位置', 'Output locations')}</summary><p>{tr('备份', 'Backup')}: {prefs.backupDirectory}</p><p>Markdown: {prefs.exportDirectory}</p><button className="text-button" onClick={() => setPage('settings')}>{tr('修改路径', 'Change paths')}</button></details><div className="migration-adapter"><label>{t('target')}</label><div className="target-grid">{PROVIDERS.filter((p) => p.id !== state.source).map((p) => <button key={p.id} disabled={busy} className={state.target === p.id ? 'chosen' : ''} onClick={() => state.setTarget(p.id)}><AgentIcon provider={p.id} />{p.name}</button>)}</div><p className="zone-help">{tr(`到 ${target.name} 的原生格式迁移尚未开放，当前可备份或导出 Markdown。`, `Native migration to ${target.name} is not available yet. Backup and Markdown export are supported.`)}</p><button className="outline-button" onClick={() => setPreview(!preview)}>{tr('查看所选会话', 'Review selection')}</button>{preview && <ul className="selected-preview">{selected.map((item) => <li key={sessionKey(item)}><b>{item.title || item.id}</b><small>{item.sourcePath}</small></li>)}</ul>}</div></>}</section>
+      </section>}
+      {page === 'backups' && <section className="utility-page" aria-label={t('nav.backups')}><div className="utility-toolbar"><h2>{tr('备份记录', 'Backup history')}</h2><button className="outline-button" onClick={refreshBackups}><RefreshCw size={15} />{t('refresh')}</button><button className="signal-button" onClick={() => setPage('migration')}><Archive size={15} />{tr('选择会话创建备份', 'Select sessions to back up')}</button></div><p className="directory-label">{prefs.backupDirectory}</p>{!backups.length ? <div className="empty-state"><Archive size={28} /><h3>{tr('还没有备份', 'No backups yet')}</h3><p>{tr('在迁移工作台选择会话，点击“创建备份”。', 'Select sessions in the workbench, then choose Create backup.')}</p></div> : <div className="backup-list">{backups.map((record) => <article className="backup-record" key={record.id}><div><h3>{date(record.createdAt)}</h3><p>{PROVIDERS.find((p) => p.id === record.provider)?.name} · {record.sessions.length} {tr('个会话', 'sessions')} · {(record.files.reduce((n, f) => n + f.bytes, 0) / 1024).toFixed(1)} KB</p><small className="output-path">{record.directory}</small></div><details><summary>{tr('查看文件与校验值', 'Files and checksums')}</summary>{record.files.map((file) => <div key={file.stored} className="file-integrity"><b>{file.stored}</b><small>{file.original}</small><code>SHA-256: {file.sha256}</code></div>)}</details></article>)}</div>}<button className="outline-button" onClick={() => openOutputDirectory('backup').catch(fail)}><FolderOpen size={15} />{tr('打开备份目录', 'Open backup directory')}</button></section>}
+      {page === 'settings' && <section className="utility-page settings-page" aria-label={t('nav.settings')}><form onSubmit={save}><h2>{tr('本地存储', 'Local storage')}</h2><label className="settings-field">{tr('备份目录', 'Backup directory')}<input required disabled={!prefsLoaded || busy} value={prefs.backupDirectory} onChange={(e) => setPrefs({ ...prefs, backupDirectory: e.target.value })} /><small>{tr('使用绝对路径。修改目录不会移动之前的备份。', 'Use an absolute path. Changing this does not move existing backups.')}</small></label><label className="settings-field">{tr('Markdown 导出目录', 'Markdown export directory')}<input required disabled={!prefsLoaded || busy} value={prefs.exportDirectory} onChange={(e) => setPrefs({ ...prefs, exportDirectory: e.target.value })} /></label><button className="signal-button" type="submit" disabled={!prefsLoaded || busy}>{tr('保存设置', 'Save settings')}</button></form><section className="appearance-settings"><h2>{tr('外观与语言', 'Appearance and language')}</h2><label>{t('theme')}<select value={dark ? 'dark' : 'light'} onChange={(e) => setDark(e.target.value === 'dark')}><option value="light">{t('light')}</option><option value="dark">{t('dark')}</option></select></label><label>{t('language')}<select value={locale} onChange={(e) => setLocale(e.target.value as typeof locale)}><option value="zh-CN">简体中文</option><option value="en-US">English</option></select></label></section><section className="about-settings"><h2>CyanBird {APP_VERSION}</h2><button className="outline-button" onClick={checkUpdates} disabled={update.status === 'checking'}><RefreshCw size={14} />{updateLabel}</button><a href="https://github.com/MusaLunar/CyanBird" target="_blank" rel="noreferrer">GitHub <ExternalLink size={14} /></a></section></section>}
+      <footer className="stage-footer"><ShieldCheck size={14} />{t('safe')}</footer>
     </main>
   </div>;
 }
-
-
-

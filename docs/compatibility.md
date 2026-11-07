@@ -1,15 +1,12 @@
-# Provider compatibility
+# Current capabilities
 
-| Provider | Native discovery | Remaining limitations |
-|---|---|---|
-| Claude Code | ~/.claude/projects; primary-session ID validation; custom title before first prompt | Claude-3p metadata root not yet adapted |
-| Antigravity | transcript.jsonl in Windows .gemini/antigravity family roots | annotations titles and workspace reconstruction pending |
-| Codex | sessions and archived_sessions; plain and .zst logs; session_meta ID/cwd; session_index titles | injected prompt filtering and page grouping need more fixtures |
-| Zcode | read-only .zcode/cli/db/db.sqlite; parentless session rows, current WAL visible to SQLite | schema variation and message/tool statistics pending |
-| DSH | DSH_HOME or ~/.dsh; .jsonl and .zstd logs | desktop additional roots and multi-generation deduplication pending |
+- Native main-session discovery for Claude Code, Antigravity, Codex, Zcode and DSH.
+- Antigravity: unique conversation IDs, summary database title/workspace, annotation title fallback, decoded file URIs and dominant Cwd fallback. Child conversations with an explicit parent are hidden from the main-session list.
+- Codex: subagent markers filter spawned threads while retaining user forks. Injected AGENTS/environment messages do not become fallback titles.
+- Backup: selected source transcripts plus manifest/SHA-256 records; Antigravity annotation sidecars included when available. Zcode takes a consistent SQLite snapshot of the **entire database**, including WAL data. Backup centers list completed manifests; incomplete attempts remain in .partial directories and are not listed as successful.
+- Markdown export: text, reasoning and available tool-call/result data. Each selected session gets a separate .md file. Zcode reads message/part tables. Malformed transcripts fail with an error rather than silently dropping lines. Referenced binary attachments are described, not embedded or downloaded.
+- Backup center and settings routes are implemented. Settings persist output directories; theme and locale persist locally. Changing directories does not move previous artifacts.
+- Native cross-provider session migration and automatic backup restoration are **not implemented**. Migration target selection is informational; available actions are backup and Markdown export.
+- Large transcript scans still decode full logs; incremental caching and broader schema compatibility remain future work.
 
-ChatGPT website conversations.json export is a separate format from Codex and is not yet wired to a file-import UI.
-
-Discovery returns source summaries only. These are not full normalized transcripts: actual target-provider export and resumability verification remain incomplete. Lists are never populated from example fixtures after a native error or an empty result.
-
-Large logs currently require full decoding during discovery; bounded reads and scan caching remain to be implemented. A few malformed records are skipped by the current parser; detailed per-file warnings are still pending.
+Icon provenance and licenses: [agent-icons.md](agent-icons.md).

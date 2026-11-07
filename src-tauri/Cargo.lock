@@ -472,9 +472,12 @@ checksum = "914a755b7c2d4af2bdcff7ce1739e2db9a1b81a9b07123d8015786ae03c0980d"
 name = "cyanbird"
 version = "0.1.0"
 dependencies = [
+ "percent-encoding",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "zstd",

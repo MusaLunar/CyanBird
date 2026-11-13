@@ -9,12 +9,12 @@ use std::{collections::HashSet, fs, io::Read, path::{Path, PathBuf}, time::{Syst
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all="camelCase")]
 pub struct Preferences { pub backup_directory:String, pub export_directory:String }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all="camelCase")]
 pub struct StoredFile { pub original:String, pub stored:String, pub bytes:u64, pub sha256:String }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all="camelCase")]
-pub struct BackupRecord { pub id:String, pub created_at:String, pub provider:String, pub sessions:Vec<SessionSummary>, pub files:Vec<StoredFile>, pub directory:String }
+pub struct BackupRecord { pub id:String, pub created_at:String, pub provider:String, pub sessions:Vec<SessionSummary>, pub files:Vec<StoredFile>, pub directory:String, #[serde(default)] pub kind:String }
 #[derive(Serialize)]
 #[serde(rename_all="camelCase")]
 pub struct ExportReceipt { pub directory:String, pub files:Vec<String> }
@@ -40,7 +40,7 @@ pub(crate) fn chosen(provider:String,ids:Vec<String>) -> Result<Vec<SessionSumma
  let result:Vec<_>=scan_sessions(provider).into_iter().filter(|s|unique.contains(&s.id)).collect();
  if result.len()!=unique.len(){return Err("Some selected sessions no longer exist; scan again".into())} Ok(result)
 }
-fn hash_file(path:&Path)->Result<String,String>{
+pub(crate) fn hash_file(path:&Path)->Result<String,String>{
  let mut f=fs::File::open(path).map_err(|e|e.to_string())?;let mut hasher=Sha256::new();let mut buffer=[0u8;65536];
  loop {let n=f.read(&mut buffer).map_err(|e|e.to_string())?;if n==0{break}hasher.update(&buffer[..n]);}Ok(format!("{:x}",hasher.finalize()))
 }
@@ -57,7 +57,9 @@ fn snapshot_file(source:&Path,target:&Path)->Result<StoredFile,String>{
  }
  Ok(StoredFile{original:source.to_string_lossy().into(),stored:target.file_name().unwrap().to_string_lossy().into(),bytes:fs::metadata(target).map_err(|e|e.to_string())?.len(),sha256:hash_file(target)?})
 }
-pub fn backup_to(root:&Path,provider:&str,sessions:Vec<SessionSummary>)->Result<BackupRecord,String>{
+pub fn backup_to(root:&Path,provider:&str,sessions:Vec<SessionSummary>)->Result<BackupRecord,String>{backup_with_kind(root,provider,sessions,"sessions")}
+pub fn backup_index_to(root:&Path,provider:&str,sessions:Vec<SessionSummary>)->Result<BackupRecord,String>{backup_with_kind(root,provider,sessions,"target-index")}
+fn backup_with_kind(root:&Path,provider:&str,sessions:Vec<SessionSummary>,kind:&str)->Result<BackupRecord,String>{
  let stage=fresh_directory(root,".partial")?; let mut files=Vec::new();let mut seen=HashSet::new();
  for session in &sessions {
   let source=PathBuf::from(&session.source_path);
@@ -65,7 +67,8 @@ pub fn backup_to(root:&Path,provider:&str,sessions:Vec<SessionSummary>)->Result<
    let name=format!("{:04}-{}",files.len(),source.file_name().ok_or("Invalid source filename")?.to_string_lossy());
    files.push(snapshot_file(&source,&stage.join(name))?);
   }
-  if provider=="antigravity" {
+  if provider=="codex"{for history in crate::codex::paths(session){if seen.insert(history.clone()){let name=format!("{:04}-{}",files.len(),history.file_name().ok_or("Invalid history filename")?.to_string_lossy());files.push(snapshot_file(&history,&stage.join(name))?);}}}
+  if provider=="antigravity" && kind=="sessions" {
    if let Some(root)=source.ancestors().nth(5) {
     let annotation=root.join("annotations").join(format!("{}.pbtxt",session.id));
     if annotation.exists() && seen.insert(annotation.clone()) {files.push(snapshot_file(&annotation,&stage.join(format!("{:04}-annotation.pbtxt",files.len())))?);}
@@ -73,11 +76,11 @@ pub fn backup_to(root:&Path,provider:&str,sessions:Vec<SessionSummary>)->Result<
   }
  }
  let id=stage.file_name().unwrap().to_string_lossy().replace(".partial-","backup-");let directory=root.join(&id);
- let record=BackupRecord{id,created_at:SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis().to_string(),provider:provider.into(),sessions,files,directory:directory.to_string_lossy().into()};
+ let record=BackupRecord{id,created_at:SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis().to_string(),provider:provider.into(),sessions,files,directory:directory.to_string_lossy().into(),kind:kind.into()};
  fs::write(stage.join("manifest.json"),serde_json::to_vec_pretty(&record).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
  fs::rename(&stage,&directory).map_err(|e|e.to_string())?;Ok(record)
 }
-fn fence(content:&str,language:&str)->String {
+pub(crate) fn fence(content:&str,language:&str)->String {
  let longest=content.split(|c|c!='`').map(str::len).max().unwrap_or(0);let marker="`".repeat(3.max(longest+1));format!("{marker}{language}\n{content}\n{marker}\n")
 }
 fn body(value:&Value)->String {
@@ -114,6 +117,7 @@ pub(crate) fn markdown_records(session:&SessionSummary,records:&[Value])->String
  out
 }
 pub(crate) fn read_export_records(session:&SessionSummary)->Result<Vec<Value>,String>{
+ if session.source=="codex"{return crate::codex::read(session)}
  if session.source=="zcode" {
   let db=Connection::open_with_flags(&session.source_path,OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e|e.to_string())?;
   let mut messages=db.prepare("SELECT id,data FROM message WHERE session_id=?1 ORDER BY time_created,id").map_err(|e|e.to_string())?;
@@ -151,7 +155,7 @@ fn export_to(root:&Path,sessions:&[SessionSummary])->Result<ExportReceipt,String
 }
 #[tauri::command] pub async fn list_backups()->Result<Vec<BackupRecord>,String>{
  tauri::async_runtime::spawn_blocking(||{let root=PathBuf::from(preferences()?.backup_directory);if !root.exists(){return Ok(Vec::new())}let mut records=Vec::new();
-  for item in fs::read_dir(root).map_err(|e|e.to_string())?{let p=item.map_err(|e|e.to_string())?.path();if p.file_name().is_some_and(|n|n.to_string_lossy().starts_with("backup-")){let raw=fs::read(p.join("manifest.json")).map_err(|e|e.to_string())?;let record:BackupRecord=serde_json::from_slice(&raw).map_err(|e|e.to_string())?;records.push(record);}}
+  for item in fs::read_dir(root).map_err(|e|e.to_string())?{let p=item.map_err(|e|e.to_string())?.path();if p.file_name().is_some_and(|n|n.to_string_lossy().starts_with("backup-")){let raw=fs::read(p.join("manifest.json")).map_err(|e|e.to_string())?;let mut record:BackupRecord=serde_json::from_slice(&raw).map_err(|e|e.to_string())?;if record.kind.is_empty(){record.kind=if crate::backup_import::index_only(&record){"target-index"}else{"sessions"}.into();}records.push(record);}}
   records.sort_by(|a,b|b.created_at.cmp(&a.created_at));Ok(records)
  }).await.map_err(|e|e.to_string())?
 }
@@ -162,6 +166,12 @@ fn export_to(root:&Path,sessions:&[SessionSummary])->Result<ExportReceipt,String
 }
 #[cfg(test)] mod tests {
  use super::*;
+ #[test]fn codex_export_reconstructs_paginated_history_at_the_fork_boundary(){
+ let root=fresh_directory(&std::env::temp_dir(),"cyanbird-codex-pages").unwrap();let old=root.join("old.jsonl");let latest=root.join("latest.jsonl");
+ fs::write(&old,"{\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{\"id\":\"fixture\"}}\n{\"ordinal\":1,\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"text\":\"EARLY\"}]}}\n{\"ordinal\":2,\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"text\":\"STALE_TAIL\"}]}}\n").unwrap();
+ fs::write(&latest,"{\"ordinal\":2,\"type\":\"session_meta\",\"payload\":{\"id\":\"fixture\",\"history_mode\":\"paginated\",\"history_base\":{\"thread_id\":\"fixture\",\"end_ordinal_exclusive\":2}}}\n{\"ordinal\":3,\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"text\":\"RECENT\"}]}}\n").unwrap();
+ let mut summary=session(&latest);summary.source="codex".into();let records=read_export_records(&summary).unwrap();let rendered=serde_json::to_string(&records).unwrap();assert!(rendered.contains("EARLY"));assert!(rendered.contains("RECENT"));assert!(!rendered.contains("STALE_TAIL"));fs::remove_file(&old).unwrap();assert!(read_export_records(&summary).unwrap_err().contains("早期历史分片"));fs::remove_dir_all(root).unwrap();
+ }
  fn session(path:&Path)->SessionSummary{SessionSummary{id:"fixture".into(),title:"Fixture session".into(),source:"claude-code".into(),workspace:Some("C:/Project".into()),updated_at:"0".into(),message_count:1,tool_call_count:0,status:"ready".into(),source_path:path.to_string_lossy().into()}}
  #[test] fn backup_manifest_matches_original_bytes_and_preserves_source(){
   let root=fresh_directory(&std::env::temp_dir(),"cyanbird-backup-test").unwrap();let source=root.join("session.jsonl");fs::write(&source,b"original transcript\n").unwrap();

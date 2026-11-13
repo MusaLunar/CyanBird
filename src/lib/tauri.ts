@@ -2,7 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import type { SessionSummary, SourceLocation } from '../types/domain';
 export interface Preferences { backupDirectory: string; exportDirectory: string; }
 export interface StoredFile { original: string; stored: string; bytes: number; sha256: string; }
-export interface BackupRecord { id: string; createdAt: string; provider: string; sessions: SessionSummary[]; files: StoredFile[]; directory: string; }
+export interface BackupRecord { id: string; createdAt: string; provider: string; sessions: SessionSummary[]; files: StoredFile[]; directory: string; kind?: 'sessions' | 'target-index'; }
 export interface ExportReceipt { directory: string; files: string[]; }
 export const discoverSources = () => invoke<SourceLocation[]>('discover_sources');
 export const discoverSessions = (provider: string) => invoke<SessionSummary[]>('discover_sessions', { provider });

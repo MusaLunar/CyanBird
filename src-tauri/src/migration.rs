@@ -1,4 +1,4 @@
-use crate::{discovery::{home,SessionSummary}, storage::{chosen,read_export_records,markdown_records,preferences,backup_to}};
+use crate::{discovery::{home,SessionSummary}, storage::{chosen,read_export_records,markdown_records,preferences,backup_to,backup_index_to,BackupRecord}};
 use serde::{Serialize,Deserialize};
 use serde_json::{json,Value};
 use std::{fs,io::Write,path::{Path,PathBuf}};
@@ -16,7 +16,7 @@ pub struct Item { pub source_id:String, pub target_id:String, pub path:String, p
 #[serde(rename_all="camelCase")]
 pub struct Receipt { pub backup_directory:String, pub items:Vec<Item> }
 fn validate(target:&str,workspace:&str)->Result<(),String>{
- if !["claude-code","codex","dsh","zcode"].contains(&target){return Err("This target has no verified native writer (Antigravity is source-only)".into())}
+ if !["claude-code","codex","dsh","zcode","antigravity"].contains(&target){return Err("Unknown migration target".into())}
  if !Path::new(workspace).is_absolute()||!Path::new(workspace).is_dir(){return Err("Choose an existing absolute project directory".into())}Ok(())
 }
 fn slug(workspace:&str)->String{workspace.chars().map(|c|if c.is_ascii_alphanumeric()||c=='_'||c=='-' {c}else{'-'}).collect()}
@@ -25,10 +25,35 @@ fn target_directory(base:&Path,target:&str,workspace:&str)->PathBuf{
  "claude-code"=>base.join(".claude/projects").join(slug(workspace)),
  "codex"=>base.join(".codex/sessions"),
  "dsh"=>std::env::var_os("DSH_HOME").map(PathBuf::from).unwrap_or_else(||base.join(".dsh")).join("sessions").join(format!("--{}--",slug(workspace))),
- "zcode"=>base.join(".zcode/cli/db"),_=>base.to_path_buf()
+ "zcode"=>base.join(".zcode/cli/db"),"antigravity"=>crate::antigravity::root(base),_=>base.to_path_buf()
  }
 }
+fn text_only(value:&Value)->Value{
+ match value{
+ Value::String(_)=>value.clone(),
+ Value::Array(items)=>Value::Array(items.iter().filter(|item|item["text"].is_string()&&matches!(item["type"].as_str(),None|Some("text"|"input_text"|"output_text"))).cloned().collect()),
+ _=>Value::Null,
+ }
+}
+pub(crate) fn for_target(summary:&SessionSummary,records:&[Value],target:&str)->Vec<Message>{
+ if target!="antigravity"{return normalize(summary,records)}
+ if summary.source=="codex"{return crate::codex::dialogue(records)}
+ // Select source message types and text blocks before conversion. Never strip
+ // fenced code or headings from already-rendered assistant/user text.
+ let dialogue:Vec<Value>=records.iter().filter_map(|r|{
+ let t=r["type"].as_str().unwrap_or("");
+ match summary.source.as_str(){
+ "claude-code" if matches!(t,"user"|"assistant")=>Some(json!({"type":t,"message":{"content":text_only(&r["message"]["content"])}})),
+ "dsh" if t=="user/message"=>Some(json!({"type":t,"data":{"content":text_only(&r["data"]["content"])}})),
+ "dsh" if t=="assistant/message"=>Some(json!({"type":t,"data":{"message":{"content":text_only(&r["data"]["message"]["content"])}}})),
+ "antigravity" if matches!(t,"USER_INPUT"|"PLANNER_RESPONSE"|"MODEL_RESPONSE")=>Some(json!({"type":if t=="MODEL_RESPONSE"{"PLANNER_RESPONSE"}else{t},"content":text_only(&r["content"])})),
+ "zcode" if matches!(r["role"].as_str(),Some("user"|"assistant"))=>Some(json!({"role":r["role"],"content":text_only(&r["content"])})),
+ _=>None,
+ }
+ }).collect();normalize(summary,&dialogue)
+}
 pub fn normalize(summary:&SessionSummary,records:&[Value])->Vec<Message>{
+ if summary.source=="codex"{return crate::codex::messages(records)}
  records.iter().filter_map(|r|{
  let t=r["type"].as_str().unwrap_or("");
  let role=match summary.source.as_str(){
@@ -99,25 +124,75 @@ fn write_jsonl(path:&Path,text:&str)->Result<(),String>{
 }
 #[tauri::command]
 pub async fn preview_migration(provider:String,ids:Vec<String>,target:String,workspace:String)->Result<Plan,String>{
- tauri::async_runtime::spawn_blocking(move||{validate(&target,&workspace)?;let sessions=chosen(provider,ids)?;let mut count=0;for s in &sessions{let records=read_export_records(s)?;let messages=normalize(s,&records);if messages.is_empty(){return Err("A selected session has no transferable messages".into())}count+=messages.len();}
- Ok(Plan{target_directory:target_directory(&home(),&target,&workspace).to_string_lossy().into(),session_count:sessions.len(),message_count:count,warnings:vec!["Tool calls, results and reasoning are archived as historical text; they are not replayed. Binary attachments are not copied. Source files are preserved in a mandatory backup.".into()]})}).await.map_err(|e|e.to_string())?
+ tauri::async_runtime::spawn_blocking(move||{validate(&target,&workspace)?;if target=="antigravity"{crate::antigravity::require_closed()?;crate::antigravity::preflight(&crate::antigravity::root(&home()))?;}let sessions=chosen(provider,ids)?;let mut count=0;for s in &sessions{let records=read_export_records(s)?;let messages=for_target(s,&records,&target);if messages.is_empty(){return Err("A selected session has no transferable messages".into())}count+=messages.len();}
+ Ok(Plan{target_directory:target_directory(&home(),&target,&workspace).to_string_lossy().into(),session_count:sessions.len(),message_count:count,warnings:vec![if target=="antigravity"{"Only user messages and assistant text are imported. Raw tools and reasoning remain in the mandatory source backup. Binary attachments are not copied.".into()}else{"Tool calls, results and reasoning are archived as historical text; they are not replayed. Binary attachments are not copied. Source files are preserved in a mandatory backup.".into()}]})}).await.map_err(|e|e.to_string())?
+}
+pub(crate) fn write_target(directory:&Path,target:&str,id:&str,title:&str,workspace:&str,messages:&[Message])->Result<PathBuf,String>{
+ let now=time::OffsetDateTime::now_utc();let path=match target{
+ "claude-code"=>directory.join(format!("{id}.jsonl")),
+ "codex"=>directory.join(format!("{:04}/{:02}/{:02}/rollout-{:04}-{:02}-{:02}T{:02}-{:02}-{:02}-{id}.jsonl",now.year(),u8::from(now.month()),now.day(),now.year(),u8::from(now.month()),now.day(),now.hour(),now.minute(),now.second())),
+ "dsh"=>directory.join(id).join("session.v4.jsonl"),
+ "antigravity"=>directory.join("conversations").join(format!("{id}.db")),_=>directory.join("db.sqlite")};
+ if target=="antigravity"{crate::antigravity::install(directory,id,title,workspace,messages)?;}else if target=="zcode"{write_sqlite(&path,id,title,workspace,messages)?;}else{write_jsonl(&path,&serialize(target,id,title,workspace,messages)?)?;}Ok(path)
+}
+fn import_snapshots(backup:&BackupRecord,snapshots:Vec<SessionSummary>,target:&str,workspace:&str,report:&Path)->Result<Receipt,String>{
+ validate(target,workspace)?;let prefs=preferences()?;let directory=target_directory(&home(),target,workspace);
+ if target=="zcode"||target=="antigravity"{
+  if target=="antigravity"{crate::antigravity::require_closed()?;crate::antigravity::preflight(&directory)?;}
+  let db=directory.join(if target=="zcode"{"db.sqlite"}else{"conversation_summaries.db"});if !db.exists(){return Err("Target database not found; initialize the target application first".into())}
+  let mut marker=snapshots.first().ok_or("No selected snapshots")?.clone();marker.source_path=db.to_string_lossy().into();let mut markers=vec![marker.clone()];
+  if target=="antigravity"{let proto=directory.join("agyhub_summaries_proto.pb");if proto.exists(){marker.source_path=proto.to_string_lossy().into();markers.push(marker);}}
+  backup_index_to(Path::new(&prefs.backup_directory),target,markers)?;
+ }
+ let mut items=Vec::new();for snapshot in snapshots{
+  let uuid=Uuid::new_v4().to_string();let id=if target=="zcode"{format!("sess_{uuid}")}else{uuid};
+  let result=(||{let records=read_export_records(&snapshot)?;let messages=for_target(&snapshot,&records,target);if messages.is_empty(){return Err("No transferable messages".into())}write_target(&directory,target,&id,&snapshot.title,workspace,&messages)})();
+  let (path,error)=match result{Ok(path)=>(path.to_string_lossy().into(),None),Err(error)=>(directory.to_string_lossy().into(),Some(error))};
+  items.push(Item{source_id:snapshot.id,target_id:id,path,status:if error.is_none(){"written"}else{"failed"}.into(),error});
+ }
+ let receipt=Receipt{backup_directory:backup.directory.clone(),items};if let Some(parent)=report.parent(){fs::create_dir_all(parent).map_err(|e|e.to_string())?;}
+ fs::write(report,serde_json::to_vec_pretty(&receipt).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;Ok(receipt)
 }
 #[tauri::command]
 pub async fn execute_migration(provider:String,ids:Vec<String>,target:String,workspace:String,acknowledged:bool)->Result<Receipt,String>{
- tauri::async_runtime::spawn_blocking(move||{validate(&target,&workspace)?;if !acknowledged{return Err("Review and acknowledge conversion differences first".into())}let sessions=chosen(provider.clone(),ids)?;let prefs=preferences()?;
- let backup=backup_to(Path::new(&prefs.backup_directory),&provider,sessions.clone())?;
- let directory=target_directory(&home(),&target,&workspace);
- if target=="zcode" {let db=directory.join("db.sqlite");if !db.exists(){return Err("Zcode database not found; initialize Zcode first".into())}let mut marker=sessions[0].clone();marker.source_path=db.to_string_lossy().into();backup_to(Path::new(&prefs.backup_directory),"zcode",vec![marker])?;}
- let mut items=Vec::new();
- for source in sessions{let uuid=Uuid::new_v4().to_string();let id=if target=="zcode"{format!("sess_{uuid}")}else{uuid};let now=time::OffsetDateTime::now_utc();let path=match target.as_str(){"claude-code"=>directory.join(format!("{id}.jsonl")),"codex"=>directory.join(format!("{:04}/{:02}/{:02}/rollout-{}-{id}.jsonl",now.year(),u8::from(now.month()),now.day(),format!("{:04}-{:02}-{:02}T{:02}-{:02}-{:02}",now.year(),u8::from(now.month()),now.day(),now.hour(),now.minute(),now.second()))),"dsh"=>directory.join(&id).join("session.v4.jsonl"),_=>directory.join("db.sqlite")};
- let result=(||{let mut snapshot=source.clone(); let stored=backup.files.iter().find(|f|f.original==source.source_path).ok_or("Missing source snapshot")?; snapshot.source_path=Path::new(&backup.directory).join(&stored.stored).to_string_lossy().into(); let records=read_export_records(&snapshot)?;let messages=normalize(&source,&records);if messages.is_empty(){return Err("No transferable messages".into())}if target=="zcode"{write_sqlite(&path,&id,&source.title,&workspace,&messages)}else{let text=serialize(&target,&id,&source.title,&workspace,&messages)?;write_jsonl(&path,&text)}})();
- items.push(Item{source_id:source.id,target_id:id,path:path.to_string_lossy().into(),status:if result.is_ok(){"written"}else{"failed"}.into(),error:result.err()});
- }
- let receipt=Receipt{backup_directory:backup.directory.clone(),items};fs::write(Path::new(&backup.directory).join("migration-report.json"),serde_json::to_vec_pretty(&receipt).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;Ok(receipt)
+ tauri::async_runtime::spawn_blocking(move||{validate(&target,&workspace)?;if !acknowledged{return Err("Review and acknowledge conversion differences first".into())}let sessions=chosen(provider.clone(),ids.clone())?;let prefs=preferences()?;
+ let backup=backup_to(Path::new(&prefs.backup_directory),&provider,sessions)?;let snapshots=crate::backup_import::sessions(&backup,&ids)?;
+ import_snapshots(&backup,snapshots,&target,&workspace,&Path::new(&backup.directory).join("migration-report.json"))
+ }).await.map_err(|e|e.to_string())?
+}
+#[tauri::command]
+pub async fn preview_backup_import(backup_id:String,ids:Vec<String>,target:String,workspace:String)->Result<Plan,String>{
+ tauri::async_runtime::spawn_blocking(move||{
+ validate(&target,&workspace)?;if target=="antigravity"{crate::antigravity::require_closed()?;crate::antigravity::preflight(&crate::antigravity::root(&home()))?;}
+ let prefs=preferences()?;let backup=crate::backup_import::load(Path::new(&prefs.backup_directory),&backup_id)?;let snapshots=crate::backup_import::sessions(&backup,&ids)?;
+ let mut count=0;for snapshot in &snapshots{let records=read_export_records(snapshot)?;let messages=for_target(snapshot,&records,&target);if messages.is_empty(){return Err("This backup has no transferable messages".into())}count+=messages.len();}
+ Ok(Plan{target_directory:target_directory(&home(),&target,&workspace).to_string_lossy().into(),session_count:snapshots.len(),message_count:count,warnings:vec!["New session IDs are created; existing sessions and source backups are preserved.".into()]})
+ }).await.map_err(|e|e.to_string())?
+}
+#[tauri::command]
+pub async fn import_backup(backup_id:String,ids:Vec<String>,target:String,workspace:String,acknowledged:bool)->Result<Receipt,String>{
+ tauri::async_runtime::spawn_blocking(move||{
+ validate(&target,&workspace)?;if !acknowledged{return Err("Confirm importing as new sessions first".into())}
+ let prefs=preferences()?;let root=Path::new(&prefs.backup_directory);let backup=crate::backup_import::load(root,&backup_id)?;let snapshots=crate::backup_import::sessions(&backup,&ids)?;
+ let report=root.join("import-reports").join(format!("import-{}.json",Uuid::new_v4()));import_snapshots(&backup,snapshots,&target,&workspace,&report)
  }).await.map_err(|e|e.to_string())?
 }
 #[cfg(test)]mod tests{
  use super::*;
+ #[test]fn antigravity_dialogue_excludes_mixed_tool_blocks_without_stripping_reply_code(){
+ let text="A normal example:\n```json\n{\"name\":\"sleep\"}\n```";
+ for source in ["claude-code","dsh","zcode","antigravity"]{
+ let summary=SessionSummary{id:"fixture".into(),title:"Fixture".into(),source:source.into(),workspace:None,updated_at:"0".into(),message_count:0,tool_call_count:0,status:"ready".into(),source_path:"fixture.jsonl".into()};
+ let blocks=json!([{"type":"text","text":text},{"type":"tool_use","name":"sleep","input":{"secret":"TOOL_ARCHIVE_OMIT"}},{"type":"reasoning","text":"THINKING_ARCHIVE_OMIT"}]);
+ let record=match source{"claude-code"=>json!({"type":"assistant","message":{"content":blocks}}),"dsh"=>json!({"type":"assistant/message","data":{"message":{"content":blocks}}}),"zcode"=>json!({"role":"assistant","content":blocks}),_=>json!({"type":"PLANNER_RESPONSE","content":text,"thinking":"THINKING_ARCHIVE_OMIT","tool_calls":[{"name":"sleep","text":"TOOL_ARCHIVE_OMIT"}]})};
+ let out=for_target(&summary,&[record],"antigravity");assert_eq!(out.len(),1,"{source}");assert_eq!(out[0].text.trim(),text,"{source}");
+ }
+ }
+ #[test]fn codex_tools_are_not_user_turns_and_completed_messages_are_kept(){
+ let s=SessionSummary{id:"fixture".into(),title:"Fixture".into(),source:"codex".into(),workspace:None,updated_at:"0".into(),message_count:0,tool_call_count:0,status:"ready".into(),source_path:"fixture.jsonl".into()};
+ let records=vec![json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"QUESTION"}]}}),json!({"type":"response_item","payload":{"type":"function_call","name":"Read","arguments":"{}"}}),json!({"type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage","id":"only-completed","content":[{"type":"Text","text":"INTERMEDIATE"}]}}}),json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"FINAL"}]}})];
+ let messages=normalize(&s,&records);assert_eq!(messages.iter().filter(|m|m.role=="user").count(),1);assert!(messages.iter().any(|m|m.text.contains("INTERMEDIATE")));assert!(messages.iter().any(|m|m.text.contains("FINAL")));
+ }
  #[test]fn writes_native_envelopes_and_preserves_roles(){let messages=vec![Message{role:"user".into(),text:"question".into()},Message{role:"assistant".into(),text:"answer".into()}];for target in ["claude-code","codex","dsh"]{let text=serialize(target,"fixture-id","Fixture","C:/Project",&messages).unwrap();let records:Vec<Value>=text.lines().map(|l|serde_json::from_str(l).unwrap()).collect();assert!(text.contains("question")&&text.contains("answer"));assert!(!records.is_empty());if target=="dsh"{for (i,e) in records.iter().skip(1).enumerate(){assert_eq!(e["seq"],i);}assert_eq!(records[3]["type"],"system/message");}}}
  #[test]fn migration_fixture_roundtrip(){
  let messages=vec![Message{role:"user".into(),text:"Please inspect the project".into()},Message{role:"assistant".into(),text:"Historical tool result: all checks passed".into()}];

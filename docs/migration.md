@@ -1,12 +1,12 @@
-# Migration support (0.2.0)
+# Migration support (0.9.0-beta)
 
 Native window decorations are disabled in Tauri. The built-in titlebar supports dragging, minimizing, maximizing/restoring and closing.
 
 | Source | Claude Code target | Codex target | DSH V4 target | Zcode target | Antigravity target |
 |---|---|---|---|---|---|
-| Claude Code / Codex / DSH / Zcode / Antigravity | supported | supported | supported | existing database required | not supported |
+| Claude Code / Codex / DSH / Zcode / Antigravity | supported | supported | supported | existing database required | Desktop 2.29, initialized store required |
 
-Migration preserves conversational roles and historical text. Tool calls/results and reasoning are archived as text rather than executable tool state. Binary attachments are not copied. Original source files are retained in a mandatory backup. This is a history migration, not an exact recreation of the old agent runtime, permissions, model or context compaction state.
+Migration preserves conversational roles and historical text. Antigravity receives user messages and assistant text, including normal code examples; tool calls/results and reasoning remain in the mandatory source backup. Other targets archive tools/results/reasoning as historical text rather than executable tool state. Binary attachments are not copied. Original source files are retained in a mandatory backup. This is a history migration, not an exact recreation of the old agent runtime, permissions, model or context compaction state.
 
 ## Flow
 
@@ -25,4 +25,4 @@ A changed target, project directory or session selection invalidates the preview
 - DSH V4 fixture events replayed successfully using the locally installed official dsh-session Session.create API.
 - Frontend test verifies preview/acknowledgment gating and invalidation after directory changes.
 
-These checks validate structure, persistence and DSH replay. They do not prove provider model execution or full UI compatibility across every vendor version. Zcode targets require an initialized database matching the supported session/message/part schema; schema errors fail without committing the new session. Antigravity remains source-only until its native conversation/protobuf writer is validated.
+These checks validate structure, persistence and DSH replay. They do not prove provider model execution or full UI compatibility across every vendor version. Zcode targets require an initialized database matching the supported session/message/part schema; schema errors fail without committing the new session. Antigravity Desktop 2.29 supports native history import; fully quit it before import and reopen afterwards. Its native language server verifies messages, title, trajectory ID and project binding across restarts. See [Antigravity import details](antigravity-import.md).

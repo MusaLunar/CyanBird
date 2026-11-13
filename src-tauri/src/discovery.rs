@@ -37,16 +37,20 @@ fn count_messages(records: &[Value]) -> usize {
 fn summary_from_json(path: &Path, provider: &str, id: String, title: String, workspace: Option<String>, records: Vec<Value>) -> SessionSummary { SessionSummary { id, title, source: provider.to_string(), workspace, updated_at: mtime(path), message_count: count_messages(&records), tool_call_count: count_tool_calls(&records), status: if records.is_empty(){"warning"}else{"ready"}.to_string(), source_path: path_string(path) } }
 fn claude_sessions() -> Vec<SessionSummary> { let root=home().join(".claude/projects"); let mut files=Vec::new(); walk(&root,0,&mut files); files.into_iter().filter(|p|p.extension().and_then(|x|x.to_str())==Some("jsonl")).filter_map(|p| { let rs=records(&p); if rs.is_empty(){return None;} let id=rs.iter().rev().find_map(|r|r.get("sessionId").and_then(Value::as_str)).or_else(||p.file_stem().and_then(|x|x.to_str()))?.to_string(); if p.file_stem().and_then(|x|x.to_str()) != Some(id.as_str()) { return None; } let title=rs.iter().rev().find_map(|r|r.get("customTitle").and_then(Value::as_str)).map(str::to_string).unwrap_or_else(||first_user(&rs,"claude")); let cwd=rs.iter().find_map(|r|r.get("cwd").and_then(Value::as_str)).map(str::to_string); Some(summary_from_json(&p,"claude-code",id,title,cwd,rs)) }).collect() }
 fn codex_sessions() -> Vec<SessionSummary> { let mut files=Vec::new(); for root in [home().join(".codex/sessions"),home().join(".codex/archived_sessions")] { walk(&root,0,&mut files); } files.into_iter().filter(|p|p.file_name().and_then(|x|x.to_str()).unwrap_or_default().starts_with("rollout-")).filter_map(|p| { let rs=records(&p); if rs.is_empty(){return None;} let meta=rs.iter().find(|r|r["type"]=="session_meta")?; if is_codex_child(&meta["payload"]) { return None; } let id=meta["payload"]["id"].as_str()?.to_string(); let mut title=first_user(&rs,"codex"); if let Ok(index)=fs::read_to_string(home().join(".codex/session_index.jsonl")) { for row in index.lines().filter_map(|line|serde_json::from_str::<Value>(line).ok()) { if row["id"].as_str()==Some(id.as_str()) { if let Some(name)=row["thread_name"].as_str(){title=name.to_string();} } } } let cwd=meta["payload"]["cwd"].as_str().map(str::to_string); Some(summary_from_json(&p,"codex",id,title,cwd,rs)) }).collect() }
+pub(crate) fn codex_history_paths(id:&str)->Vec<PathBuf>{
+ let mut files=Vec::new();for root in [home().join(".codex/sessions"),home().join(".codex/archived_sessions")]{walk(&root,0,&mut files);}
+ files.into_iter().filter(|p|p.file_name().and_then(|n|n.to_str()).is_some_and(|n|n.starts_with("rollout-"))&&crate::codex::header(p).is_some_and(|r|r["type"]=="session_meta"&&r["payload"]["id"].as_str()==Some(id)&&!is_codex_child(&r["payload"]))).collect()
+}
 fn antigravity_sessions() -> Vec<SessionSummary> {
  let mut out=Vec::new();
  for name in ["antigravity","antigravity-cli","antigravity-ide"] {
   let root=home().join(".gemini").join(name);
   let mut summaries=std::collections::HashMap::<String,(String,Option<String>,bool)>::new();
   if let Ok(db)=rusqlite::Connection::open_with_flags(root.join("conversation_summaries.db"),rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) {
-   if let Ok(mut statement)=db.prepare("SELECT conversation_id,title,workspace_uris,parent_conversation_id FROM conversation_summaries") {
-    if let Ok(rows)=statement.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))) {
-     for (id,title,uris,parent) in rows.flatten() {
-      let workspace=serde_json::from_str::<Vec<String>>(&uris).ok().and_then(|u|u.first().map(|p|workspace_uri(p)));
+   if let Ok(mut statement)=db.prepare("SELECT conversation_id,title,workspace_uris,parent_conversation_id,project_id FROM conversation_summaries") {
+    if let Ok(rows)=statement.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?))) {
+     for (id,title,uris,parent,project) in rows.flatten() {
+      let workspace=serde_json::from_str::<Vec<String>>(&uris).ok().and_then(|u|u.first().map(|p|workspace_uri(p))).or_else(||crate::antigravity::project_workspace(&root,&project));
       summaries.insert(id,(title,workspace,!parent.trim().is_empty()));
      }
     }
